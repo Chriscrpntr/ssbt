@@ -14,8 +14,40 @@ import argparse
 import os
 import re
 from typing import Any
-
 import yaml
+import openpyxl
+import warnings
+import pandas as pd
+import duckdb
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _coerce_cell(val):
+    """Convert an openpyxl cell value to a proper Python type.
+    
+    Formula errors (#DIV/0!, #VALUE!, etc.) become None.
+    Numeric strings become int/float.
+    """
+    if val is None:
+        return None
+    if isinstance(val, (int, float)):
+        # Check for NaN from formula errors
+        if isinstance(val, float) and val != val:
+            return None
+        return val
+    # Check for Excel error constants (openpyxl stores them as strings like '#DIV/0!')
+    if isinstance(val, str) and val.startswith('#'):
+        return None
+    # Try numeric conversion
+    try:
+        f = float(val)
+        if f == int(f) and '.' not in str(val):
+            return int(f)
+        return f
+    except (ValueError, TypeError):
+        return val
 
 
 # ---------------------------------------------------------------------------
@@ -172,7 +204,6 @@ def compile_sql(
 # ---------------------------------------------------------------------------
 
 def _enumerate_sheets(path: str) -> list[str]:
-    import openpyxl
     wb = openpyxl.load_workbook(path, read_only=True)
     names = wb.sheetnames
     wb.close()
@@ -181,7 +212,6 @@ def _enumerate_sheets(path: str) -> list[str]:
 
 def _get_existing_sheets(path: str) -> list[str]:
     try:
-        import openpyxl
         wb = openpyxl.load_workbook(path, read_only=True)
         names = wb.sheetnames
         wb.close()
@@ -204,8 +234,6 @@ def run_manifest(
     dry_run: bool = False,
 ) -> None:
     """Execute models in DAG order."""
-    import duckdb
-    import pandas as pd
 
     con = duckdb.connect()
     manifest_dir = os.path.dirname(os.path.abspath(yml_path))
@@ -240,10 +268,32 @@ def run_manifest(
             table_map[table_name] = table_name
             all_sheet_names.setdefault(sheet_name, []).append(src_name)
             sql = f"SELECT * FROM read_xlsx('{src_path}', sheet='{sheet_name}')"
-            df = con.execute(sql).fetchdf()
-            df.columns = [str(c).replace(" ", "_").replace("-", "_") for c in df.columns]
-            con.execute(f"DROP TABLE IF EXISTS {table_name}")
-            con.execute(f"CREATE TABLE {table_name} AS {sql}")
+            try:
+                df = con.execute(sql).fetchdf()
+                df.columns = [str(c).replace(" ", "_").replace("-", "_") for c in df.columns]
+                con.execute(f"DROP TABLE IF EXISTS {table_name}")
+                con.execute(f"CREATE TABLE {table_name} AS SELECT * FROM {table_name}")
+            except Exception:
+                # read_xlsx fails on formula errors (#DIV/0!, #VALUE!, etc.)
+                # Fall back to openpyxl which reads cell values directly
+
+                warnings.filterwarnings("ignore")
+                wb = openpyxl.load_workbook(src_path, data_only=True)
+                ws = wb[sheet_name]
+                rows = list(ws.iter_rows(values_only=True))
+                wb.close()
+                if not rows:
+                    con.execute(f"CREATE TABLE {table_name} (id INTEGER)")
+                    con.execute(f"INSERT INTO {table_name} VALUES (NULL)")
+                    continue
+                header = [str(c).replace(" ", "_").replace("-", "_") for c in rows[0]]
+                data = [tuple(_coerce_cell(v) for v in row) for row in rows[1:]]
+                if not data:
+                    con.execute(f"CREATE TABLE {table_name} ({', '.join(f'{h} VARCHAR' for h in header)})")
+                    continue
+
+                df = pd.DataFrame(data, columns=header)
+                con.register(table_name, df)
     # Also register bare sheet names as aliases if unambiguous
     for sheet_name, src_names in all_sheet_names.items():
         if len(src_names) == 1:
@@ -254,9 +304,23 @@ def run_manifest(
             if src_sheets and sheet_name not in src_sheets:
                 continue
             src_path = os.path.join(manifest_dir, src["path"])
-            sql = f"SELECT * FROM read_xlsx('{src_path}', sheet='{sheet_name}')"
+            alias_name = sheet_name
             con.execute(f"DROP TABLE IF EXISTS {alias_name}")
-            con.execute(f"CREATE TABLE {alias_name} AS {sql}")
+            try:
+                con.execute(f"CREATE TABLE {alias_name} AS SELECT * FROM read_xlsx('{src_path}', sheet='{sheet_name}')")
+            except Exception:
+                # read_xlsx fails on formula errors — fall back to openpyxl
+                wb = openpyxl.load_workbook(src_path, data_only=True)
+                ws = wb[sheet_name]
+                rows = list(ws.iter_rows(values_only=True))
+                wb.close()
+                if rows:
+                    header = [str(c).replace(" ", "_").replace("-", "_") for c in rows[0]]
+                    data = [tuple(_coerce_cell(v) for v in row) for row in rows[1:]]
+                    if data:
+
+                        df = pd.DataFrame(data, columns=header)
+                        con.register(alias_name, df)
 
     # Execute models in order
     for model_name in execution_order:
@@ -303,8 +367,6 @@ def run_manifest(
 
 
 def _read_all_sheets(path: str) -> dict[str, "pd.DataFrame"]:
-    import openpyxl
-    import pandas as pd
     sheets = {}
     wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
     for name in wb.sheetnames:
@@ -314,7 +376,6 @@ def _read_all_sheets(path: str) -> dict[str, "pd.DataFrame"]:
 
 
 def _write_all_sheets(sheets: dict[str, "pd.DataFrame"], path: str) -> None:
-    import pandas as pd
     with pd.ExcelWriter(path, engine="openpyxl") as writer:
         for name, df in sheets.items():
             df.to_excel(writer, sheet_name=name, index=False)
@@ -333,8 +394,6 @@ def run_tests(
     output_path: str,
 ) -> list[dict[str, Any]]:
     """Run schema tests against the output. Returns list of test results."""
-    import duckdb
-    import pandas as pd
 
     con = duckdb.connect()
 
@@ -361,10 +420,30 @@ def run_tests(
             table_map[table_name] = table_name
             all_sheet_names.setdefault(sheet_name, []).append(src_name)
             sql = f"SELECT * FROM read_xlsx('{src_path}', sheet='{sheet_name}')"
-            df = con.execute(sql).fetchdf()
-            df.columns = [str(c).replace(" ", "_").replace("-", "_") for c in df.columns]
-            con.execute(f"DROP TABLE IF EXISTS {table_name}")
-            con.execute(f"CREATE TABLE {table_name} AS {sql}")
+            try:
+                df = con.execute(sql).fetchdf()
+                df.columns = [str(c).replace(" ", "_").replace("-", "_") for c in df.columns]
+                con.execute(f"DROP TABLE IF EXISTS {table_name}")
+                con.execute(f"CREATE TABLE {table_name} AS SELECT * FROM {table_name}")
+            except Exception:
+                # read_xlsx fails on formula errors (#DIV/0!, #VALUE!, etc.)
+                # Fall back to openpyxl which reads cell values directly
+                warnings.filterwarnings("ignore")
+                wb = openpyxl.load_workbook(src_path, data_only=True)
+                ws = wb[sheet_name]
+                rows = list(ws.iter_rows(values_only=True))
+                wb.close()
+                if not rows:
+                    con.execute(f"CREATE TABLE {table_name} (id INTEGER)")
+                    con.execute(f"INSERT INTO {table_name} VALUES (NULL)")
+                    continue
+                header = [str(c).replace(" ", "_").replace("-", "_") for c in rows[0]]
+                data = [tuple(_coerce_cell(v) for v in row) for row in rows[1:]]
+                if not data:
+                    con.execute(f"CREATE TABLE {table_name} ({', '.join(f'{h} VARCHAR' for h in header)})")
+                    continue
+                df = pd.DataFrame(data, columns=header)
+                con.register(table_name, df)
     # Also register bare sheet names as aliases if unambiguous
     for sheet_name, src_names in all_sheet_names.items():
         if len(src_names) == 1:
@@ -375,9 +454,22 @@ def run_tests(
             if src_sheets and sheet_name not in src_sheets:
                 continue
             src_path = os.path.join(manifest_dir, src["path"])
-            sql = f"SELECT * FROM read_xlsx('{src_path}', sheet='{sheet_name}')"
+            alias_name = sheet_name
             con.execute(f"DROP TABLE IF EXISTS {alias_name}")
-            con.execute(f"CREATE TABLE {alias_name} AS {sql}")
+            try:
+                con.execute(f"CREATE TABLE {alias_name} AS SELECT * FROM read_xlsx('{src_path}', sheet='{sheet_name}')")
+            except Exception:
+                # read_xlsx fails on formula errors — fall back to openpyxl
+                wb = openpyxl.load_workbook(src_path, data_only=True)
+                ws = wb[sheet_name]
+                rows = list(ws.iter_rows(values_only=True))
+                wb.close()
+                if rows:
+                    header = [str(c).replace(" ", "_").replace("-", "_") for c in rows[0]]
+                    data = [tuple(_coerce_cell(v) for v in row) for row in rows[1:]]
+                    if data:
+                        df = pd.DataFrame(data, columns=header)
+                        con.register(alias_name, df)
 
     # Build output by running models (same as build, but capture results)
     for model_name in execution_order:
