@@ -48,7 +48,28 @@ Done.
 8 passed, 0 failed
 ```
 
-## Project Structure
+### Test marks
+
+| Mark | Meaning |
+|---|---|
+| ✓ | Test passed |
+| ✗ | Test failed |
+| ! | Test skipped/warned (e.g., uniqueness test skipped due to nulls) |
+
+### Failures
+
+```
+  ✓ raw_orders.order_id (not_null)
+  ✓ raw_orders.order_id (unique)
+  ✓ raw_orders.status (accepted_values)
+  ✗ completed_orders.total (positive)
+  ✓ enriched_orders.order_id (not_null)
+  ✓ enriched_orders.order_id (unique)
+  ✓ enriched_orders.email (not_null)
+
+7 passed, 1 failed
+  FAIL completed_orders.total (positive): 2 non-positive values: [0.0, -5.0]
+```
 
 ```
 my-project/
@@ -103,8 +124,6 @@ Models reference them via `{{ ref('orders_raw_orders') }}` or `{{ ref('raw_order
 models:
   - name: completed_orders
     path: models/completed_orders.sql
-    depends_on:
-      - raw_orders
     config:
       output: output/completed_orders.xlsx
       output_sheet: completed_orders
@@ -115,11 +134,12 @@ models:
           - positive
 ```
 
+Dependencies are **inferred from `{{ ref('name') }}` in the SQL files** — no `depends_on` needed.
+
 | Key | Description |
 |---|---|
 | `name` | Model name — used as table name in DuckDB and as the default output sheet name |
 | `path` | Path to the SQL file (relative to ssbt.yml) |
-| `depends_on` | List of model names this model depends on |
 | `config.output` | Output file path (default: `{output_dir}/{model_name}.xlsx`) |
 | `config.output_sheet` | Output sheet name within the file (default: model name) |
 | `columns[].name` | Column name to test |
@@ -184,16 +204,11 @@ models:
 
   - name: completed_orders
     path: models/completed_orders.sql
-    depends_on:
-      - raw_orders
     config:
       output: output/completed_orders.xlsx
 
   - name: enriched_orders
     path: models/enriched_orders.sql
-    depends_on:
-      - completed_orders
-      - customers
     config:
       output: output/enriched_orders.xlsx
     columns:
@@ -208,28 +223,25 @@ models:
 
   - name: region_summary
     path: models/region_summary.sql
-    depends_on:
-      - enriched_orders
     config:
       output: output/region_summary.xlsx
 
   - name: top_customers
     path: models/top_customers.sql
-    depends_on:
-      - enriched_orders
     config:
       output: output/top_customers.xlsx
 ```
 
 ## How It Works
 
-1. **Parse** `ssbt.yml` — load models, resolve dependencies
-2. **Resolve DAG** — topological sort with cycle detection
-3. **Load SQL** — read `.sql` files, resolve `{{ ref('name') }}` macros
-4. **Register sources** — load source sheets from input files into DuckDB tables
-5. **Execute** — run models in DAG order, materializing each result in DuckDB
-6. **Write output** — write each model's result to its configured output file
-7. **Test** — `ssbt test` runs schema tests, writes results to `test_results` sheet
+1. **Parse** `ssbt.yml` — load models and sources
+2. **Infer dependencies** — scan SQL files for `{{ ref('name') }}` calls to build the DAG
+3. **Resolve DAG** — topological sort with cycle detection
+4. **Compile SQL** — resolve `{{ ref('name') }}` into subqueries
+5. **Register sources** — load source sheets from input files into DuckDB tables
+6. **Execute** — run models in DAG order, materializing each result in DuckDB
+7. **Write output** — write each model's result to its configured output file
+8. **Test** — `ssbt test` runs schema tests, writes results to `test_results` sheet
 
 ## CLI
 
@@ -248,7 +260,7 @@ ssbt docs  [--yml FILE]
 
 ## SQL
 
-Models are plain SQL queries that run against DuckDB. Source sheets are available as tables.
+Models are plain SQL queries that run against DuckDB. Use `{{ ref('name') }}` to reference other models — it gets resolved into a subquery at compile time.
 
 ```sql
 -- models/enriched_orders.sql
@@ -258,15 +270,15 @@ SELECT
     o.region,
     o.total,
     c.email
-FROM raw_orders o
-JOIN customers_customer_list c ON o.customer = c.name
+FROM {{ ref('completed_orders') }} o
+JOIN {{ ref('customers_customer_list') }} c ON o.customer = c.name
 WHERE o.status = 'completed'
 ```
 
-`{{ ref('model_name') }}` references other model outputs:
+For source sheets, use the `{source_name}_{sheet_name}` table name:
 
 ```sql
-SELECT * FROM {{ ref('completed_orders') }}
+SELECT * FROM {{ ref('orders_raw_orders') }}
 ```
 
 ## Requirements

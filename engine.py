@@ -36,7 +36,6 @@ def load_models(cfg: dict[str, Any]) -> dict[str, dict[str, Any]]:
         name = entry["name"]
         models[name] = {
             "sql_path": entry["path"],
-            "depends_on": entry.get("depends_on", []),
             "config": entry.get("config", {}),
             "columns": entry.get("columns", []),
         }
@@ -61,21 +60,44 @@ def load_sources(cfg: dict[str, Any]) -> list[dict[str, Any]]:
 def resolve_dag(models: dict[str, dict[str, Any]], sources: list[dict[str, Any]] | None = None) -> list[str]:
     """Topological sort of models. Returns execution order.
 
-    Sources are treated as leaf nodes — they have no dependencies and
-    are always available as tables.
+    Dependencies are inferred from {{ ref('name') }} in SQL files.
+    Sources are treated as leaf nodes (no ordering needed).
     """
+    if sources is None:
+        sources = []
+
+    # Build a map of model_name -> set of {{ ref() }} deps from SQL
+    ref_deps: dict[str, set[str]] = {}
+    for name, model in models.items():
+        sql_path = os.path.join(os.path.dirname(os.path.abspath("ssbt.yml")), model["sql_path"])
+        with open(sql_path) as f:
+            sql = f.read()
+        deps = set()
+        for m in _REF_RE.finditer(sql):
+            dep_name = m.group(1)
+            if dep_name in models:  # only model deps, not source tables
+                deps.add(dep_name)
+        ref_deps[name] = deps
+
+    # Sources are known leaf nodes
+    known: set[str] = set(models.keys())
+    for source in sources:
+        src_name = source["name"]
+        src_sheets = source.get("sheets")
+        if src_sheets:
+            for s in src_sheets:
+                known.add(f"{src_name}_{s}")
+        else:
+            wb = openpyxl.load_workbook(os.path.join(os.path.dirname(os.path.abspath("ssbt.yml")), source["path"]), read_only=True)
+            for s in wb.sheetnames:
+                known.add(f"{src_name}_{s}")
+            wb.close()
+
     visited: set[str] = set()
     order: list[str] = []
     path: list[str] = []
 
-    # Treat source names as known (but don't include them in execution order)
-    known: set[str] = set()
-    if sources:
-        for source in sources:
-            known.add(source["name"])
-    known.update(models.keys())
-
-    def visit(name: str):
+    def visit(name: str) -> None:
         if name in path:
             cycle = path[path.index(name):] + [name]
             raise ValueError(f"Circular dependency: {' -> '.join(cycle)}")
@@ -86,7 +108,7 @@ def resolve_dag(models: dict[str, dict[str, Any]], sources: list[dict[str, Any]]
         if name not in models:
             return  # source, skip
         path.append(name)
-        for dep in models[name]["depends_on"]:
+        for dep in ref_deps.get(name, set()):
             visit(dep)
         path.pop()
         visited.add(name)
@@ -422,9 +444,20 @@ def _run_test(
         ).fetchdf()
         if len(df) > 0:
             status = "fail"
-            rows_str = "; ".join(str(df.iloc[i].tolist()) for i in range(len(df)))
-            # Clean up numpy types from the string
-            rows_str = rows_str.replace("np.float64(nan)", "None")
+            # Convert numpy types to Python native for clean display
+            clean_rows = []
+            for i in range(len(df)):
+                row = []
+                for val in df.iloc[i].tolist():
+                    if hasattr(val, 'item'):
+                        val = val.item()
+                    if isinstance(val, float) and (val != val):  # nan check
+                        val = None
+                    elif isinstance(val, float) and val == int(val):
+                        val = int(val)
+                    row.append(val)
+                clean_rows.append(str(row))
+            rows_str = "; ".join(clean_rows)
             message = f"{len(df)} null values: {rows_str}"
 
     elif test_name == "unique":

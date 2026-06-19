@@ -31,8 +31,6 @@ models:
 
   - name: completed_orders
     path: models/completed_orders.sql
-    depends_on:
-      - raw_orders
     config:
       output: output/completed_orders.xlsx
       output_sheet: completed_orders
@@ -44,9 +42,6 @@ models:
 
   - name: enriched_orders
     path: models/enriched_orders.sql
-    depends_on:
-      - completed_orders
-      - customers
     config:
       output: output/enriched_orders.xlsx
       output_sheet: enriched_orders
@@ -61,16 +56,12 @@ models:
 
   - name: region_summary
     path: models/region_summary.sql
-    depends_on:
-      - enriched_orders
     config:
       output: output/region_summary.xlsx
       output_sheet: region_summary
 
   - name: top_customers
     path: models/top_customers.sql
-    depends_on:
-      - enriched_orders
     config:
       output: output/top_customers.xlsx
       output_sheet: top_customers
