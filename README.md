@@ -273,14 +273,14 @@ Dependency graph:
 ----------------------------------------
   raw_orders
   completed_orders <- raw_orders
-  enriched_orders
+  enriched_orders <- completed_orders
   region_summary <- enriched_orders
   top_customers <- enriched_orders
 
 Sources:
 ----------------------------------------
   orders:
-    file: input.xlsx
+    file: data/orders.xlsx
     sheet: raw_orders -> table: orders_raw_orders
   customers:
     file: data/customers.xlsx
@@ -294,7 +294,7 @@ Models:
     columns:
       order_id: not_null
       order_id: unique
-      status: accepted_values(...)
+      status: accepted_values({'values': ['completed', 'pending', 'cancelled']})
 
   completed_orders:
     sql: models/completed_orders.sql
@@ -303,7 +303,25 @@ Models:
     columns:
       total: not_null
       total: positive
-...
+
+  enriched_orders:
+    sql: models/enriched_orders.sql
+    output: output/enriched_orders.xlsx
+    depends_on: completed_orders
+    columns:
+      order_id: not_null
+      order_id: unique
+      email: not_null
+
+  region_summary:
+    sql: models/region_summary.sql
+    output: output/region_summary.xlsx
+    depends_on: enriched_orders
+
+  top_customers:
+    sql: models/top_customers.sql
+    output: output/top_customers.xlsx
+    depends_on: enriched_orders
 ```
 
 ## SQL
