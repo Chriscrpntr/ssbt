@@ -58,6 +58,8 @@ def load_manifest(yml_path: str) -> dict[str, Any]:
     """Load ssbt.yml and return the full parsed config."""
     with open(yml_path) as f:
         cfg = yaml.safe_load(f)
+    if cfg is None:
+        raise ValueError(f"{yml_path} is empty or invalid YAML")
     return cfg
 
 
@@ -190,8 +192,7 @@ def compile_sql(
                 )
                 _compiled.add(dep_name)
             dep_sql = models[dep_name]["_compiled_sql"]
-            table_name = table_map.get(dep_name, dep_name)
-            return f"(\n{dep_sql}\n) AS {table_name}"
+            return f"(\n{dep_sql}\n)"
         else:
             # Source table — just use the DuckDB table name
             return table_map.get(dep_name, dep_name)
@@ -247,6 +248,16 @@ def run_manifest(
         cfg = models[name].get("config", {})
         if "output" not in cfg:
             cfg["output"] = os.path.join(output_dir, f"{name}.xlsx")
+
+    # Validate source files exist
+    for source in sources:
+        src_path = os.path.join(manifest_dir, source["path"])
+        if not os.path.exists(src_path):
+            print(f"Error: source file not found: {src_path}", file=__import__("sys").stderr)
+            raise SystemExit(1)
+
+    # Create output directory
+    os.makedirs(output_dir, exist_ok=True)
 
     # Register sources as DuckDB tables
     # Source tables are named {source_name}_{sheet_name}
@@ -395,6 +406,15 @@ def run_tests(
 ) -> list[dict[str, Any]]:
     """Run schema tests against the output. Returns list of test results."""
 
+    manifest_dir = os.path.dirname(os.path.abspath(yml_path))
+
+    # Validate source files exist
+    for source in sources:
+        src_path = os.path.join(manifest_dir, source["path"])
+        if not os.path.exists(src_path):
+            print(f"Error: source file not found: {src_path}", file=__import__("sys").stderr)
+            raise SystemExit(1)
+
     con = duckdb.connect()
 
     # Load SQL
@@ -498,18 +518,19 @@ def run_tests(
                 results.append(test_result)
 
     # Write test results to output
+    test_output = os.path.join(output_path.rstrip("/"), "test_results.xlsx")
     if results:
         results_df = pd.DataFrame(results)
-        if not os.path.exists(output_path):
-            results_df.to_excel(output_path, sheet_name="test_results", index=False)
+        if not os.path.exists(test_output):
+            results_df.to_excel(test_output, sheet_name="test_results", index=False)
         else:
-            existing = _get_existing_sheets(output_path)
+            existing = _get_existing_sheets(test_output)
             if "test_results" in existing:
-                all_sheets = _read_all_sheets(output_path)
+                all_sheets = _read_all_sheets(test_output)
                 all_sheets["test_results"] = results_df
-                _write_all_sheets(all_sheets, output_path)
+                _write_all_sheets(all_sheets, test_output)
             else:
-                with pd.ExcelWriter(output_path, engine="openpyxl", mode="a",
+                with pd.ExcelWriter(test_output, engine="openpyxl", mode="a",
                                     if_sheet_exists="replace") as writer:
                     results_df.to_excel(writer, sheet_name="test_results", index=False)
 
@@ -810,14 +831,27 @@ def _print_test_results(results: list[dict[str, Any]]) -> None:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="ssbt — spreadsheet build tool")
+    parser = argparse.ArgumentParser(
+        prog="ssbt",
+        description="ssbt — spreadsheet build tool. dbt for engineers who live in Excel.",
+    )
     parser.add_argument("action", choices=["build", "run", "test", "docs"],
-                        help="build: run models + tests | test: run tests only | run: models only")
-    parser.add_argument("--yml", default="ssbt.yml", help="ssbt.yml path")
-    parser.add_argument("--input", default="input.xlsx", help="Input Excel (legacy: single file)")
-    parser.add_argument("--output", default="output.xlsx", help="Output Excel")
-    parser.add_argument("--dry-run", action="store_true")
+                        help="build: run models + tests | test: run tests only | run: models only | docs: show project docs")
+    parser.add_argument("--yml", default="ssbt.yml",
+                        help="Path to ssbt.yml manifest (default: ssbt.yml)")
+    parser.add_argument("--input", default="input.xlsx",
+                        help="Default input Excel file (used when no sources defined in manifest)")
+    parser.add_argument("--output", default="output/",
+                        help="Output directory for generated files (default: output/)")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Show compiled SQL without executing models or tests")
+    parser.add_argument("--select", nargs="+", metavar="MODEL",
+                        help="Only build/test specified models (e.g., ssbt build --select enriched_orders)")
     args = parser.parse_args()
+
+    # Validate: --select requires build or test
+    if args.select and args.action not in ("build", "test"):
+        parser.error("--select only works with 'build' or 'test'")
 
     cfg = load_manifest(args.yml)
     models = load_models(cfg)
@@ -828,6 +862,26 @@ def main():
         sources = [{"name": "input", "path": args.input, "sheets": None}]
 
     order = resolve_dag(models, sources)
+
+    # Apply --select filter
+    if args.select:
+        missing = set(args.select) - set(models.keys())
+        if missing:
+            print(f"Error: unknown models: {', '.join(sorted(missing))}", file=__import__("sys").stderr)
+            raise SystemExit(1)
+        # Filter DAG order to only selected models and their transitive deps
+        selected: set[str] = set()
+        def _collect(name: str) -> None:
+            if name in selected:
+                return
+            selected.add(name)
+            for dep in _get_model_deps(name, models, os.path.dirname(os.path.abspath(args.yml))):
+                _collect(dep)
+        for name in args.select:
+            _collect(name)
+        order = [n for n in order if n in selected]
+        original_models = models
+        models = {n: m for n, m in original_models.items() if n in selected}
 
     if args.action in ("build", "run"):
         run_manifest(models, sources, order, args.yml, args.input, args.output, dry_run=args.dry_run)

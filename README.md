@@ -1,6 +1,6 @@
 # ssbt — Spreadsheet Build Tool
 
-dbt inspired project for engineers who live in Excel.
+dbt for engineers who live in Excel.
 
 Turn spreadsheets into a version-controlled, testable build pipeline using SQL and YAML — no database required.
 
@@ -8,7 +8,7 @@ Turn spreadsheets into a version-controlled, testable build pipeline using SQL a
 
 ```
 ssbt build          # run models + run tests
-ssbt build --dry    # show compiled SQL without executing
+ssbt build --dry-run    # show compiled SQL without executing
 ssbt test           # run schema tests only
 ```
 
@@ -97,7 +97,6 @@ my-project/
 |---|---|---|
 | `name` | yes | Project name |
 | `version` | no | Project version string |
-| `flags` | no | `store_failures: true` — persist test failures |
 | `sources` | no | List of input file paths (see Inputs below) |
 | `models` | yes | List of model definitions |
 
@@ -177,8 +176,6 @@ tests:
 ```yaml
 name: orders-pipeline
 version: "1.0"
-flags:
-  store_failures: true
 
 sources:
   - name: orders
@@ -216,10 +213,9 @@ models:
         tests:
           - not_null
           - unique
-      - name: total
+      - name: email
         tests:
           - not_null
-          - positive
 
   - name: region_summary
     path: models/region_summary.sql
@@ -246,8 +242,8 @@ models:
 ## CLI
 
 ```
-ssbt build [--yml FILE] [--input FILE] [--output DIR] [--dry-run]
-ssbt test  [--yml FILE] [--input FILE] [--output DIR]
+ssbt build [--yml FILE] [--input FILE] [--output DIR] [--dry-run] [--select MODEL ...]
+ssbt test  [--yml FILE] [--input FILE] [--output DIR] [--select MODEL ...]
 ssbt docs  [--yml FILE]
 ```
 
@@ -256,7 +252,8 @@ ssbt docs  [--yml FILE]
 | `--yml` | `ssbt.yml` | Path to manifest |
 | `--input` | `input.xlsx` | Default input file (for single-file mode) |
 | `--output` | `output/` | Output directory (per-model files) |
-|| `--dry-run` | — | Show compiled SQL without executing |
+| `--dry-run` | — | Show compiled SQL without executing |
+| `--select` | — | Only build/test specified models (`ssbt build --select enriched_orders`) |
 
 ## Docs
 
