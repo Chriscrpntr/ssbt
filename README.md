@@ -1,6 +1,6 @@
 # ssbt — Spreadsheet Build Tool
 
-dbt for engineers who live in Excel.
+dbt inspired project for engineers who live in Excel.
 
 Turn spreadsheets into a version-controlled, testable build pipeline using SQL and YAML — no database required.
 
@@ -256,7 +256,58 @@ ssbt docs  [--yml FILE]
 | `--yml` | `ssbt.yml` | Path to manifest |
 | `--input` | `input.xlsx` | Default input file (for single-file mode) |
 | `--output` | `output/` | Output directory (per-model files) |
-| `--dry-run` | — | Show compiled SQL without executing |
+|| `--dry-run` | — | Show compiled SQL without executing |
+
+## Docs
+
+```
+ssbt docs
+```
+
+Outputs project documentation to stdout:
+
+```
+============================================================
+  orders-pipeline
+  5 models, 2 sources
+============================================================
+
+Dependency graph:
+----------------------------------------
+  raw_orders
+  completed_orders <- raw_orders
+  enriched_orders
+  region_summary <- enriched_orders
+  top_customers <- enriched_orders
+
+Sources:
+----------------------------------------
+  orders:
+    file: input.xlsx
+    sheet: raw_orders -> table: orders_raw_orders
+  customers:
+    file: data/customers.xlsx
+    sheet: customer_list -> table: customers_customer_list
+
+Models:
+----------------------------------------
+  raw_orders:
+    sql: models/raw_orders.sql
+    output: output/raw_orders.xlsx
+    columns:
+      order_id: not_null
+      order_id: unique
+      status: accepted_values(...)
+
+  completed_orders:
+    sql: models/completed_orders.sql
+    output: output/completed_orders.xlsx
+    depends_on: raw_orders
+    columns:
+      total: not_null
+      total: positive
+...
+```
 
 ## SQL
 

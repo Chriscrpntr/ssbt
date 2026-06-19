@@ -623,6 +623,167 @@ def _run_test(
 # CLI
 # ---------------------------------------------------------------------------
 
+
+def _get_model_deps(model_name: str, models: dict[str, dict[str, Any]], manifest_dir: str) -> list[str]:
+    """Get model-to-model dependencies from SQL files."""
+    model = models[model_name]
+    sql_path = os.path.join(manifest_dir, model["sql_path"])
+    with open(sql_path) as f:
+        sql = f.read()
+    deps = []
+    for m in _REF_RE.finditer(sql):
+        dep_name = m.group(1)
+        if dep_name in models:
+            deps.append(dep_name)
+    return deps
+
+
+def _get_model_tests(model_name: str, models: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    """Extract tests for a model's columns from the manifest."""
+    model = models[model_name]
+    tests = []
+    for col in model.get("columns", []):
+        for test in col.get("tests", []):
+            if isinstance(test, dict):
+                test_name = list(test.keys())[0]
+                tests.append({"column": col["name"], "test": test_name, "args": test[test_name]})
+            else:
+                tests.append({"column": col["name"], "test": test, "args": None})
+    return tests
+
+
+def _get_source_sheets(source: dict[str, Any], manifest_dir: str) -> list[str]:
+    """Get sheet names for a source."""
+    sheets = source.get("sheets")
+    if sheets:
+        return sheets
+    src_path = os.path.join(manifest_dir, source["path"])
+    wb = openpyxl.load_workbook(src_path, read_only=True)
+    names = wb.sheetnames
+    wb.close()
+    return names
+
+
+def _get_column_types(model_name: str, sources: list[dict[str, Any]], execution_order: list[str]) -> dict[str, str]:
+    """Infer column types by reading the first model that produces them.
+    
+    For source columns, reads from the actual Excel file.
+    For model columns, reads from the most downstream model that references them.
+    """
+    types: dict[str, str] = {}
+    # Check sources first
+    for source in sources:
+        src_path = os.path.join(os.path.dirname(os.path.abspath("ssbt.yml")), source["path"])
+        sheets = source.get("sheets")
+        if sheets:
+            sheet_names = sheets
+        else:
+            wb = openpyxl.load_workbook(src_path, read_only=True)
+            sheet_names = wb.sheetnames
+            wb.close()
+        for sheet_name in sheet_names:
+            table_name = f"{source['name']}_{sheet_name}"
+            wb = openpyxl.load_workbook(src_path, read_only=True)
+            ws = wb[sheet_name]
+            rows = list(ws.iter_rows(values_only=True))
+            wb.close()
+            if not rows:
+                continue
+            header = rows[0]
+            data = rows[1:]
+            for i, col_name in enumerate(header):
+                col_types = set()
+                for row in data[:50]:  # sample up to 50 rows
+                    val = row[i] if i < len(row) else None
+                    if val is None or (isinstance(val, float) and val != val):
+                        continue
+                    if isinstance(val, int):
+                        col_types.add("INTEGER")
+                    elif isinstance(val, float):
+                        col_types.add("DOUBLE")
+                    elif isinstance(val, str):
+                        col_types.add("VARCHAR")
+                    elif isinstance(val, bool):
+                        col_types.add("BOOLEAN")
+                    elif isinstance(val, datetime):
+                        col_types.add("TIMESTAMP")
+                if col_types:
+                    # Pick the most specific type
+                    if "DOUBLE" in col_types and "INTEGER" in col_types:
+                        col_types.discard("INTEGER")
+                    types[f"{table_name}.{col_name}"] = col_types.pop() if len(col_types) == 1 else "VARCHAR"
+    return types
+
+
+def generate_docs(
+    models: dict[str, dict[str, Any]],
+    sources: list[dict[str, Any]],
+    execution_order: list[str],
+    yml_path: str,
+) -> None:
+    """Generate documentation: DAG, model schemas, and source catalog."""
+    manifest_dir = os.path.dirname(os.path.abspath(yml_path))
+    project_name = load_manifest(yml_path).get("name", "ssbt-pipeline")
+
+    # --- DAG ---
+    print(f"=" * 60)
+    print(f"  {project_name}")
+    print(f"  {len(models)} models, {len(sources)} sources")
+    print("=" * 60)
+    print()
+
+    # Build adjacency for text graph
+    print("Dependency graph:")
+    print("-" * 40)
+    for name in execution_order:
+        deps = _get_model_deps(name, models, manifest_dir)
+        if deps:
+            dep_str = " <- ".join([name] + deps)
+        else:
+            dep_str = name
+        print(f"  {dep_str}")
+    print()
+
+    # --- Sources ---
+    print("Sources:")
+    print("-" * 40)
+    for source in sources:
+        sheets = _get_source_sheets(source, manifest_dir)
+        print(f"  {source['name']}:")
+        print(f"    file: {source['path']}")
+        for s in sheets:
+            table_name = f"{source['name']}_{s}"
+            print(f"    sheet: {s} -> table: {table_name}")
+    print()
+
+    # --- Model schemas ---
+    print("Models:")
+    print("-" * 40)
+    for name in execution_order:
+        model = models[name]
+        tests = _get_model_tests(name, models)
+        cfg = model.get("config", {})
+        output = cfg.get("output", f"{name}.xlsx")
+        print(f"  {name}:")
+        print(f"    sql: {model['sql_path']}")
+        print(f"    output: {output}")
+        deps = _get_model_deps(name, models, manifest_dir)
+        if deps:
+            print(f"    depends_on: {', '.join(deps)}")
+        if tests:
+            print(f"    columns:")
+            for t in tests:
+                test_str = t["test"]
+                if t["args"]:
+                    test_str += f"({t['args']})"
+                print(f"      {t['column']}: {test_str}")
+        print()
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
 def _print_test_results(results: list[dict[str, Any]]) -> None:
     """Print test results with checkmarks, return True if all passed."""
     passed = sum(1 for r in results if r["status"] == "pass")
@@ -677,7 +838,7 @@ def main():
         results = run_tests(models, sources, order, args.yml, args.input, args.output)
         _print_test_results(results)
     elif args.action == "docs":
-        print("docs: not yet implemented")
+        generate_docs(models, sources, order, args.yml)
 
     print("Done.")
 
