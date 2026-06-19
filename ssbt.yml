@@ -1,0 +1,76 @@
+name: orders-pipeline
+version: "1.0"
+flags:
+  store_failures: true
+
+sources:
+  - name: orders
+    path: data/orders.xlsx
+    sheets:
+      - raw_orders
+  - name: customers
+    path: data/customers.xlsx
+    sheets:
+      - customer_list
+
+models:
+  - name: raw_orders
+    path: models/raw_orders.sql
+    config:
+      output: output/raw_orders.xlsx
+      output_sheet: raw_orders
+    columns:
+      - name: order_id
+        tests:
+          - not_null
+          - unique
+      - name: status
+        tests:
+          - accepted_values:
+              values: ["completed", "pending", "cancelled"]
+
+  - name: completed_orders
+    path: models/completed_orders.sql
+    depends_on:
+      - raw_orders
+    config:
+      output: output/completed_orders.xlsx
+      output_sheet: completed_orders
+    columns:
+      - name: total
+        tests:
+          - not_null
+          - positive
+
+  - name: enriched_orders
+    path: models/enriched_orders.sql
+    depends_on:
+      - completed_orders
+      - customers
+    config:
+      output: output/enriched_orders.xlsx
+      output_sheet: enriched_orders
+    columns:
+      - name: order_id
+        tests:
+          - not_null
+          - unique
+      - name: email
+        tests:
+          - not_null
+
+  - name: region_summary
+    path: models/region_summary.sql
+    depends_on:
+      - enriched_orders
+    config:
+      output: output/region_summary.xlsx
+      output_sheet: region_summary
+
+  - name: top_customers
+    path: models/top_customers.sql
+    depends_on:
+      - enriched_orders
+    config:
+      output: output/top_customers.xlsx
+      output_sheet: top_customers

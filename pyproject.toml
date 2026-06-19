@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "ssbt"
+version = "0.1.0"
+description = "Spreadsheet Build Tool — dbt for Excel"
+requires-python = ">=3.9"
+dependencies = [
+    "duckdb>=1.0",
+    "openpyxl>=3.1",
+    "pandas>=2.0",
+    "pyyaml>=6.0",
+]
+
+[project.scripts]
+ssbt = "ssbt.engine:main"
+
+[tool.setuptools.packages.find]
+include = ["ssbt*"]
