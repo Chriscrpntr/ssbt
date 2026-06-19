@@ -1,6 +1,6 @@
 # ssbt — Spreadsheet Build Tool
 
-dbt for engineers who live in Excel.
+dbt inspired project for engineers who live in Excel.
 
 Turn spreadsheets into a version-controlled, testable build pipeline using SQL and YAML — no database required.
 
