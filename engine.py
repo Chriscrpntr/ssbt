@@ -3,13 +3,14 @@ ssbt — spreadsheet build tool.
 dbt for engineers who live in Excel.
 
 Usage:
-    ssbt build [--yml FILE] [--input FILE] [--output FILE] [--dry-run]
-    ssbt test  [--yml FILE] [--input FILE] [--output FILE]
+    ssbt build [--yml FILE] [--input FILE] [--output DIR] [--dry-run] [--select MODEL ...]
+    ssbt test  [--yml FILE] [--input FILE] [--output DIR] [--select MODEL ...]
     ssbt docs  [--yml FILE]
 """
 
 from __future__ import annotations
 
+import sys
 import argparse
 import os
 import re
@@ -91,7 +92,7 @@ def load_sources(cfg: dict[str, Any]) -> list[dict[str, Any]]:
 # DAG resolution
 # ---------------------------------------------------------------------------
 
-def resolve_dag(models: dict[str, dict[str, Any]], sources: list[dict[str, Any]] | None = None) -> list[str]:
+def resolve_dag(models: dict[str, dict[str, Any]], sources: list[dict[str, Any]] | None = None, manifest_dir: str | None = None) -> list[str]:
     """Topological sort of models. Returns execution order.
 
     Dependencies are inferred from {{ ref('name') }} in SQL files.
@@ -99,11 +100,13 @@ def resolve_dag(models: dict[str, dict[str, Any]], sources: list[dict[str, Any]]
     """
     if sources is None:
         sources = []
+    if manifest_dir is None:
+        manifest_dir = os.getcwd()
 
     # Build a map of model_name -> set of {{ ref() }} deps from SQL
     ref_deps: dict[str, set[str]] = {}
     for name, model in models.items():
-        sql_path = os.path.join(os.path.dirname(os.path.abspath("ssbt.yml")), model["sql_path"])
+        sql_path = os.path.join(manifest_dir, model["sql_path"])
         with open(sql_path) as f:
             sql = f.read()
         deps = set()
@@ -122,7 +125,7 @@ def resolve_dag(models: dict[str, dict[str, Any]], sources: list[dict[str, Any]]
             for s in src_sheets:
                 known.add(f"{src_name}_{s}")
         else:
-            wb = openpyxl.load_workbook(os.path.join(os.path.dirname(os.path.abspath("ssbt.yml")), source["path"]), read_only=True)
+            wb = openpyxl.load_workbook(os.path.join(manifest_dir, source["path"]), read_only=True)
             for s in wb.sheetnames:
                 known.add(f"{src_name}_{s}")
             wb.close()
@@ -253,7 +256,7 @@ def run_manifest(
     for source in sources:
         src_path = os.path.join(manifest_dir, source["path"])
         if not os.path.exists(src_path):
-            print(f"Error: source file not found: {src_path}", file=__import__("sys").stderr)
+            print(f"Error: source file not found: {src_path}", file=sys.stderr)
             raise SystemExit(1)
 
     # Create output directory
@@ -391,38 +394,13 @@ def _write_all_sheets(sheets: dict[str, "pd.DataFrame"], path: str) -> None:
         for name, df in sheets.items():
             df.to_excel(writer, sheet_name=name, index=False)
 
-
 # ---------------------------------------------------------------------------
 # Schema tests
 # ---------------------------------------------------------------------------
 
-def run_tests(
-    models: dict[str, dict[str, Any]],
-    sources: list[dict[str, Any]],
-    execution_order: list[str],
-    yml_path: str,
-    input_path: str,
-    output_path: str,
-) -> list[dict[str, Any]]:
-    """Run schema tests against the output. Returns list of test results."""
 
-    manifest_dir = os.path.dirname(os.path.abspath(yml_path))
-
-    # Validate source files exist
-    for source in sources:
-        src_path = os.path.join(manifest_dir, source["path"])
-        if not os.path.exists(src_path):
-            print(f"Error: source file not found: {src_path}", file=__import__("sys").stderr)
-            raise SystemExit(1)
-
-    con = duckdb.connect()
-
-    # Load SQL
-    manifest_dir = os.path.dirname(os.path.abspath(yml_path))
-    for name in models:
-        models[name]["sql"] = load_sql(models[name], manifest_dir)
-
-    # Register sources
+def _register_sources(con, sources, manifest_dir) -> tuple[dict[str, str], list[str]]:
+    """Register source sheets as DuckDB tables. Returns (table_map, all_sheet_names)."""
     table_map: dict[str, str] = {}
     all_sheet_names: dict[str, list[str]] = {}
     for source in sources:
@@ -446,8 +424,6 @@ def run_tests(
                 con.execute(f"DROP TABLE IF EXISTS {table_name}")
                 con.execute(f"CREATE TABLE {table_name} AS SELECT * FROM {table_name}")
             except Exception:
-                # read_xlsx fails on formula errors (#DIV/0!, #VALUE!, etc.)
-                # Fall back to openpyxl which reads cell values directly
                 warnings.filterwarnings("ignore")
                 wb = openpyxl.load_workbook(src_path, data_only=True)
                 ws = wb[sheet_name]
@@ -479,7 +455,7 @@ def run_tests(
             try:
                 con.execute(f"CREATE TABLE {alias_name} AS SELECT * FROM read_xlsx('{src_path}', sheet='{sheet_name}')")
             except Exception:
-                # read_xlsx fails on formula errors — fall back to openpyxl
+                warnings.filterwarnings("ignore")
                 wb = openpyxl.load_workbook(src_path, data_only=True)
                 ws = wb[sheet_name]
                 rows = list(ws.iter_rows(values_only=True))
@@ -490,6 +466,36 @@ def run_tests(
                     if data:
                         df = pd.DataFrame(data, columns=header)
                         con.register(alias_name, df)
+    return table_map, all_sheet_names
+
+
+def run_tests(
+    models: dict[str, dict[str, Any]],
+    sources: list[dict[str, Any]],
+    execution_order: list[str],
+    yml_path: str,
+    input_path: str,
+    output_path: str,
+) -> list[dict[str, Any]]:
+    """Run schema tests against the output. Returns list of test results."""
+
+    manifest_dir = os.path.dirname(os.path.abspath(yml_path))
+
+    # Validate source files exist
+    for source in sources:
+        src_path = os.path.join(manifest_dir, source["path"])
+        if not os.path.exists(src_path):
+            print(f"Error: source file not found: {src_path}", file=sys.stderr)
+            raise SystemExit(1)
+
+    con = duckdb.connect()
+
+    # Load SQL
+    for name in models:
+        models[name]["sql"] = load_sql(models[name], manifest_dir)
+
+    # Register sources (DRY — shared helper)
+    table_map, _ = _register_sources(con, sources, manifest_dir)
 
     # Build output by running models (same as build, but capture results)
     for model_name in execution_order:
@@ -546,7 +552,6 @@ def _run_test(
     con: "duckdb.DuckDBPyConnection",
 ) -> dict[str, Any]:
     """Run a single schema test. Returns {model, column, test, status, message}."""
-    import pandas as pd
 
     status = "pass"
     message = ""
@@ -685,57 +690,6 @@ def _get_source_sheets(source: dict[str, Any], manifest_dir: str) -> list[str]:
     return names
 
 
-def _get_column_types(model_name: str, sources: list[dict[str, Any]], execution_order: list[str]) -> dict[str, str]:
-    """Infer column types by reading the first model that produces them.
-    
-    For source columns, reads from the actual Excel file.
-    For model columns, reads from the most downstream model that references them.
-    """
-    types: dict[str, str] = {}
-    # Check sources first
-    for source in sources:
-        src_path = os.path.join(os.path.dirname(os.path.abspath("ssbt.yml")), source["path"])
-        sheets = source.get("sheets")
-        if sheets:
-            sheet_names = sheets
-        else:
-            wb = openpyxl.load_workbook(src_path, read_only=True)
-            sheet_names = wb.sheetnames
-            wb.close()
-        for sheet_name in sheet_names:
-            table_name = f"{source['name']}_{sheet_name}"
-            wb = openpyxl.load_workbook(src_path, read_only=True)
-            ws = wb[sheet_name]
-            rows = list(ws.iter_rows(values_only=True))
-            wb.close()
-            if not rows:
-                continue
-            header = rows[0]
-            data = rows[1:]
-            for i, col_name in enumerate(header):
-                col_types = set()
-                for row in data[:50]:  # sample up to 50 rows
-                    val = row[i] if i < len(row) else None
-                    if val is None or (isinstance(val, float) and val != val):
-                        continue
-                    if isinstance(val, int):
-                        col_types.add("INTEGER")
-                    elif isinstance(val, float):
-                        col_types.add("DOUBLE")
-                    elif isinstance(val, str):
-                        col_types.add("VARCHAR")
-                    elif isinstance(val, bool):
-                        col_types.add("BOOLEAN")
-                    elif isinstance(val, datetime):
-                        col_types.add("TIMESTAMP")
-                if col_types:
-                    # Pick the most specific type
-                    if "DOUBLE" in col_types and "INTEGER" in col_types:
-                        col_types.discard("INTEGER")
-                    types[f"{table_name}.{col_name}"] = col_types.pop() if len(col_types) == 1 else "VARCHAR"
-    return types
-
-
 def generate_docs(
     models: dict[str, dict[str, Any]],
     sources: list[dict[str, Any]],
@@ -861,13 +815,14 @@ def main():
     if not sources:
         sources = [{"name": "input", "path": args.input, "sheets": None}]
 
-    order = resolve_dag(models, sources)
+    manifest_dir = os.path.dirname(os.path.abspath(args.yml))
+    order = resolve_dag(models, sources, manifest_dir)
 
     # Apply --select filter
     if args.select:
         missing = set(args.select) - set(models.keys())
         if missing:
-            print(f"Error: unknown models: {', '.join(sorted(missing))}", file=__import__("sys").stderr)
+            print(f"Error: unknown models: {', '.join(sorted(missing))}", file=sys.stderr)
             raise SystemExit(1)
         # Filter DAG order to only selected models and their transitive deps
         selected: set[str] = set()

@@ -68,7 +68,7 @@ Done.
   ✓ enriched_orders.email (not_null)
 
 7 passed, 1 failed
-  FAIL completed_orders.total (positive): 2 non-positive values: [0.0, -5.0]
+  FAIL completed_orders.total (positive): 2 non-positive values: [0, -5]
 ```
 
 ```
