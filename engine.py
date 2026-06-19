@@ -262,79 +262,8 @@ def run_manifest(
     # Create output directory
     os.makedirs(output_dir, exist_ok=True)
 
-    # Register sources as DuckDB tables
-    # Source tables are named {source_name}_{sheet_name}
-    # Also register bare sheet names as aliases if unambiguous (for backward compat)
-    table_map: dict[str, str] = {}
-    all_sheet_names: dict[str, list[str]] = {}
-    for source in sources:
-        src_name = source["name"]
-        src_path = os.path.join(manifest_dir, source["path"])
-        sheets = source.get("sheets")
-        if sheets:
-            sheet_names = sheets
-        else:
-            wb = openpyxl.load_workbook(src_path, read_only=True)
-            sheet_names = wb.sheetnames
-            wb.close()
-        for sheet_name in sheet_names:
-            table_name = f"{src_name}_{sheet_name}"
-            table_map[table_name] = table_name
-            all_sheet_names.setdefault(sheet_name, []).append(src_name)
-            sql = f"SELECT * FROM read_xlsx('{src_path}', sheet='{sheet_name}')"
-            try:
-                df = con.execute(sql).fetchdf()
-                df.columns = [str(c).replace(" ", "_").replace("-", "_") for c in df.columns]
-                con.execute(f"DROP TABLE IF EXISTS {table_name}")
-                con.execute(f"CREATE TABLE {table_name} AS SELECT * FROM {table_name}")
-            except Exception:
-                # read_xlsx fails on formula errors (#DIV/0!, #VALUE!, etc.)
-                # Fall back to openpyxl which reads cell values directly
-
-                warnings.filterwarnings("ignore")
-                wb = openpyxl.load_workbook(src_path, data_only=True)
-                ws = wb[sheet_name]
-                rows = list(ws.iter_rows(values_only=True))
-                wb.close()
-                if not rows:
-                    con.execute(f"CREATE TABLE {table_name} (id INTEGER)")
-                    con.execute(f"INSERT INTO {table_name} VALUES (NULL)")
-                    continue
-                header = [str(c).replace(" ", "_").replace("-", "_") for c in rows[0]]
-                data = [tuple(_coerce_cell(v) for v in row) for row in rows[1:]]
-                if not data:
-                    con.execute(f"CREATE TABLE {table_name} ({', '.join(f'{h} VARCHAR' for h in header)})")
-                    continue
-
-                df = pd.DataFrame(data, columns=header)
-                con.register(table_name, df)
-    # Also register bare sheet names as aliases if unambiguous
-    for sheet_name, src_names in all_sheet_names.items():
-        if len(src_names) == 1:
-            table_map[sheet_name] = f"{src_names[0]}_{sheet_name}"
-            alias_name = sheet_name
-            src = next(s for s in sources if s["name"] == src_names[0])
-            src_sheets = src.get("sheets")
-            if src_sheets and sheet_name not in src_sheets:
-                continue
-            src_path = os.path.join(manifest_dir, src["path"])
-            alias_name = sheet_name
-            con.execute(f"DROP TABLE IF EXISTS {alias_name}")
-            try:
-                con.execute(f"CREATE TABLE {alias_name} AS SELECT * FROM read_xlsx('{src_path}', sheet='{sheet_name}')")
-            except Exception:
-                # read_xlsx fails on formula errors — fall back to openpyxl
-                wb = openpyxl.load_workbook(src_path, data_only=True)
-                ws = wb[sheet_name]
-                rows = list(ws.iter_rows(values_only=True))
-                wb.close()
-                if rows:
-                    header = [str(c).replace(" ", "_").replace("-", "_") for c in rows[0]]
-                    data = [tuple(_coerce_cell(v) for v in row) for row in rows[1:]]
-                    if data:
-
-                        df = pd.DataFrame(data, columns=header)
-                        con.register(alias_name, df)
+    # Register sources (DRY — shared helper)
+    table_map, _ = _register_sources(con, sources, manifest_dir)
 
     # Execute models in order
     for model_name in execution_order:
@@ -596,13 +525,18 @@ def _run_test(
             ).fetchall()
             if dupes:
                 status = "fail"
-                message = f"{len(dupes)} duplicate values: {', '.join(str(d[0]) for d in dupes)}"
+                dup_vals = [str(d[0]) for d in dupes[:20]]
+                extra = f" (and {len(dupes) - 20} more)" if len(dupes) > 20 else ""
+                message = f"{len(dupes)} duplicate values: {', '.join(dup_vals)}{extra}"
 
     elif test_name == "accepted_values":
         allowed = test_args.get("values", [])
+        # Escape single quotes for SQL safety
+        escaped = [str(v).replace("'", "''") for v in allowed]
+        sql_vals = ",".join(f"'{e}'" for e in escaped)
         violations = con.execute(
             f"SELECT * FROM {model_name} "
-            f"WHERE {column_name} IS NOT NULL AND {column_name} NOT IN ({','.join(repr(v) for v in allowed)})"
+            f"WHERE {column_name} IS NOT NULL AND {column_name} NOT IN ({sql_vals})"
         ).fetchall()
         if violations:
             status = "fail"
@@ -750,7 +684,17 @@ def generate_docs(
             for t in tests:
                 test_str = t["test"]
                 if t["args"]:
-                    test_str += f"({t['args']})"
+                    if isinstance(t["args"], dict):
+                        # Format dict args nicely: accepted_values(values: A, B, C)
+                        parts = []
+                        for k, v in t["args"].items():
+                            if isinstance(v, list):
+                                parts.append(f"{k}: {', '.join(str(x) for x in v)}")
+                            else:
+                                parts.append(f"{k}: {v}")
+                        test_str += f"({', '.join(parts)})"
+                    else:
+                        test_str += f"({t['args']})"
                 print(f"      {t['column']}: {test_str}")
         print()
 
