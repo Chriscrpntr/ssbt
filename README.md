@@ -56,8 +56,6 @@ my-project/
 │   ├── raw_orders.sql
 │   ├── completed_orders.sql
 │   └── region_summary.sql
-└── tests/                # model tests (optional)
-    └── test_schema.yml
 ```
 
 ## ssbt.yml
