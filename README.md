@@ -4,6 +4,8 @@ dbt inspired tool for engineers who deal with Excel Spreadsheets.
 
 Turn spreadsheets into a version-controlled, testable build pipeline using SQL and YAML — no database required.
 
+Built with heavy use of AI tools for ideation, documentation, and occasional refactoring suggestions. All core implementation, testing, and final decisions were done manually by the author.
+
 ## Features
 
 - Spreadsheet in/out (Excel files)
